@@ -27,15 +27,23 @@ import logging
 import numpy as np
 from pathlib import Path
 
-tools = importlib.import_module('.', 'tools')
-ppocr = importlib.import_module('.', 'ppocr')
-ppstructure = importlib.import_module('.', 'ppstructure')
+def _import_file(module_name, file_path, make_importable=False):
+    spec = importlib.util.spec_from_file_location(module_name, file_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    if make_importable:
+        sys.modules[module_name] = module
+    return module
+
+tools = _import_file('tools', os.path.join(__dir__, 'tools/__init__.py'), make_importable=True)
+ppocr = importlib.import_module('ppocr', 'paddleocr')
+ppstructure = importlib.import_module('ppstructure', 'paddleocr')
 
 from tools.infer import predict_system
 from ppocr.utils.logging import get_logger
 
 logger = get_logger()
-from ppocr.utils.utility import check_and_read, get_image_file_list
+from ppocr.utils.utility import check_and_read, get_image_file_list, alpha_to_color, binarize_img
 from ppocr.utils.network import maybe_download, download_with_progressbar, is_link, confirm_model_dir_url
 from tools.infer.utility import draw_ocr, str2bool, check_gpu
 from ppstructure.utility import init_args, draw_structure_result
@@ -47,14 +55,14 @@ __all__ = [
 ]
 
 SUPPORT_DET_MODEL = ['DB']
-VERSION = '2.6.0.1'
+VERSION = '2.6.1.0'
 SUPPORT_REC_MODEL = ['CRNN', 'SVTR_LCNet']
 BASE_DIR = os.path.expanduser("~/.paddleocr/")
 
 DEFAULT_OCR_MODEL_VERSION = 'PP-OCRv3'
 SUPPORT_OCR_MODEL_VERSION = ['PP-OCR', 'PP-OCRv2', 'PP-OCRv3']
-DEFAULT_STRUCTURE_MODEL_VERSION = 'PP-Structurev2'
-SUPPORT_STRUCTURE_MODEL_VERSION = ['PP-Structure', 'PP-Structurev2']
+DEFAULT_STRUCTURE_MODEL_VERSION = 'PP-StructureV2'
+SUPPORT_STRUCTURE_MODEL_VERSION = ['PP-Structure', 'PP-StructureV2']
 MODEL_URLS = {
     'OCR': {
         'PP-OCRv3': {
@@ -272,7 +280,7 @@ MODEL_URLS = {
                 }
             }
         },
-        'PP-Structurev2': {
+        'PP-StructureV2': {
             'table': {
                 'en': {
                     'url':
@@ -326,10 +334,10 @@ def parse_args(mMain=True):
         "--structure_version",
         type=str,
         choices=SUPPORT_STRUCTURE_MODEL_VERSION,
-        default='PP-Structurev2',
+        default='PP-StructureV2',
         help='Model version, the current model support list is as follows:'
         ' 1. PP-Structure Support en table structure model.'
-        ' 2. PP-Structurev2 Support ch and en table structure model.')
+        ' 2. PP-StructureV2 Support ch and en table structure model.')
 
     for action in parser._actions:
         if action.dest in [
@@ -416,7 +424,7 @@ def get_model_config(type, version, model_type, lang):
 
 def img_decode(content: bytes):
     np_arr = np.frombuffer(content, dtype=np.uint8)
-    return cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+    return cv2.imdecode(np_arr, cv2.IMREAD_UNCHANGED)
 
 
 def check_img(img):
@@ -428,8 +436,8 @@ def check_img(img):
             download_with_progressbar(img, 'tmp.jpg')
             img = 'tmp.jpg'
         image_file = img
-        img, flag, _ = check_and_read(image_file)
-        if not flag:
+        img, flag_gif, flag_pdf = check_and_read(image_file)
+        if not flag_gif and not flag_pdf:
             with open(image_file, 'rb') as f:
                 img = img_decode(f.read())
         if img is None:
@@ -480,10 +488,11 @@ class PaddleOCR(predict_system.TextSystem):
             params.rec_image_shape = "3, 48, 320"
         else:
             params.rec_image_shape = "3, 32, 320"
-        # download model
-        maybe_download(params.det_model_dir, det_url)
-        maybe_download(params.rec_model_dir, rec_url)
-        maybe_download(params.cls_model_dir, cls_url)
+        # download model if using paddle infer
+        if not params.use_onnx:
+            maybe_download(params.det_model_dir, det_url)
+            maybe_download(params.rec_model_dir, rec_url)
+            maybe_download(params.cls_model_dir, cls_url)
 
         if params.det_algorithm not in SUPPORT_DET_MODEL:
             logger.error('det_algorithm must in {}'.format(SUPPORT_DET_MODEL))
@@ -499,15 +508,19 @@ class PaddleOCR(predict_system.TextSystem):
         logger.debug(params)
         # init det_model and rec_model
         super().__init__(params)
+        self.page_num = params.page_num
 
-    def ocr(self, img, det=True, rec=True, cls=True):
+    def ocr(self, img, det=True, rec=True, cls=True, bin=False, inv=False, alpha_color=(255, 255, 255)):
         """
-        ocr with paddleocr
+        OCR with PaddleOCR
         args：
-            img: img for ocr, support ndarray, img_path and list or ndarray
-            det: use text detection or not. If false, only rec will be exec. Default is True
-            rec: use text recognition or not. If false, only det will be exec. Default is True
-            cls: use angle classifier or not. Default is True. If true, the text with rotation of 180 degrees can be recognized. If no text is rotated by 180 degrees, use cls=False to get better performance. Text with rotation of 90 or 270 degrees can be recognized even if cls=False.
+            img: img for OCR, support ndarray, img_path and list or ndarray
+            det: use text detection or not. If False, only rec will be exec. Default is True
+            rec: use text recognition or not. If False, only det will be exec. Default is True
+            cls: use angle classifier or not. Default is True. If True, the text with rotation of 180 degrees can be recognized. If no text is rotated by 180 degrees, use cls=False to get better performance. Text with rotation of 90 or 270 degrees can be recognized even if cls=False.
+            bin: binarize image to black and white. Default is False.
+            inv: invert image colors. Default is False.
+            alpha_color: set RGB color Tuple for transparent parts replacement. Default is pure white.
         """
         assert isinstance(img, (np.ndarray, list, str, bytes))
         if isinstance(img, list) and det == True:
@@ -515,28 +528,66 @@ class PaddleOCR(predict_system.TextSystem):
             exit(0)
         if cls == True and self.use_angle_cls == False:
             logger.warning(
-                'Since the angle classifier is not initialized, the angle classifier will not be uesd during the forward process'
+                'Since the angle classifier is not initialized, it will not be used during the forward process'
             )
 
         img = check_img(img)
+        # for infer pdf file
+        if isinstance(img, list):
+            if self.page_num > len(img) or self.page_num == 0:
+                imgs = img
+            else:
+                imgs = img[:self.page_num]
+        else:
+            imgs = [img]
+
+        def preprocess_image(_image):
+            _image = alpha_to_color(_image, alpha_color)
+            if inv:
+                _image = cv2.bitwise_not(_image)
+            if bin:
+                _image = binarize_img(_image)
+            return _image
 
         if det and rec:
-            dt_boxes, rec_res, _ = self.__call__(img, cls)
-            return [[box.tolist(), res] for box, res in zip(dt_boxes, rec_res)]
+            ocr_res = []
+            for idx, img in enumerate(imgs):
+                img = preprocess_image(img)
+                dt_boxes, rec_res, _ = self.__call__(img, cls)
+                if not dt_boxes and not rec_res:
+                    ocr_res.append(None)
+                    continue
+                tmp_res = [[box.tolist(), res]
+                           for box, res in zip(dt_boxes, rec_res)]
+                ocr_res.append(tmp_res)
+            return ocr_res
         elif det and not rec:
-            dt_boxes, elapse = self.text_detector(img)
-            if dt_boxes is None:
-                return None
-            return [box.tolist() for box in dt_boxes]
+            ocr_res = []
+            for idx, img in enumerate(imgs):
+                img = preprocess_image(img)
+                dt_boxes, elapse = self.text_detector(img)
+                if not dt_boxes:
+                    ocr_res.append(None)
+                    continue
+                tmp_res = [box.tolist() for box in dt_boxes]
+                ocr_res.append(tmp_res)
+            return ocr_res
         else:
-            if not isinstance(img, list):
-                img = [img]
-            if self.use_angle_cls and cls:
-                img, cls_res, elapse = self.text_classifier(img)
-                if not rec:
-                    return cls_res
-            rec_res, elapse = self.text_recognizer(img)
-            return rec_res
+            ocr_res = []
+            cls_res = []
+            for idx, img in enumerate(imgs):
+                if not isinstance(img, list):
+                    img = preprocess_image(img)
+                    img = [img]
+                if self.use_angle_cls and cls:
+                    img, cls_res_tmp, elapse = self.text_classifier(img)
+                    if not rec:
+                        cls_res.append(cls_res_tmp)
+                rec_res, elapse = self.text_recognizer(img)
+                ocr_res.append(rec_res)
+            if not rec:
+                return cls_res
+            return ocr_res
 
 
 class PPStructure(StructureSystem):
@@ -546,6 +597,7 @@ class PPStructure(StructureSystem):
         assert params.structure_version in SUPPORT_STRUCTURE_MODEL_VERSION, "structure_version must in {}, but get {}".format(
             SUPPORT_STRUCTURE_MODEL_VERSION, params.structure_version)
         params.use_gpu = check_gpu(params.use_gpu)
+        params.mode = 'structure'
 
         if not params.show_log:
             logger.setLevel(logging.INFO)
@@ -627,21 +679,38 @@ def main():
         img_name = os.path.basename(img_path).split('.')[0]
         logger.info('{}{}{}'.format('*' * 10, img_path, '*' * 10))
         if args.type == 'ocr':
-            result = engine.ocr(img_path,
-                                det=args.det,
-                                rec=args.rec,
-                                cls=args.use_angle_cls)
+            result = engine.ocr(
+                img_path,
+                det=args.det,
+                rec=args.rec,
+                cls=args.use_angle_cls,
+                bin=args.binarize,
+                inv=args.invert,
+                alpha_color=args.alphacolor
+            )
             if result is not None:
-                for line in result:
-                    logger.info(line)
+                for idx in range(len(result)):
+                    res = result[idx]
+                    for line in res:
+                        logger.info(line)
         elif args.type == 'structure':
             img, flag_gif, flag_pdf = check_and_read(img_path)
             if not flag_gif and not flag_pdf:
                 img = cv2.imread(img_path)
 
+            if args.recovery and args.use_pdf2docx_api and flag_pdf:
+                from pdf2docx.converter import Converter
+                docx_file = os.path.join(args.output,
+                                         '{}.docx'.format(img_name))
+                cv = Converter(img_path)
+                cv.convert(docx_file)
+                cv.close()
+                logger.info('docx save to {}'.format(docx_file))
+                continue
+
             if not flag_pdf:
                 if img is None:
-                    logger.error("error in loading image:{}".format(image_file))
+                    logger.error("error in loading image:{}".format(img_path))
                     continue
                 img_paths = [[img_path, img]]
             else:
@@ -660,7 +729,7 @@ def main():
                 logger.info('processing {}/{} page:'.format(index + 1,
                                                             len(img_paths)))
                 new_img_name = os.path.basename(new_img_path).split('.')[0]
-                result = engine(new_img_path, img_idx=index)
+                result = engine(img, img_idx=index)
                 save_structure_res(result, args.output, img_name, index)
 
                 if args.recovery and result != []:
@@ -674,14 +743,13 @@ def main():
             if args.recovery and all_res != []:
                 try:
                     from ppstructure.recovery.recovery_to_doc import convert_info_docx
-                    convert_info_docx(img, all_res, args.output, img_name,
-                                      args.save_pdf)
+                    convert_info_docx(img, all_res, args.output, img_name)
                 except Exception as ex:
                     logger.error(
                         "error in layout recovery image:{}, err msg: {}".format(
                             img_name, ex))
                     continue
-            
+
             for item in all_res:
                 item.pop('img')
                 item.pop('res')

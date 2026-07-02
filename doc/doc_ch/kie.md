@@ -205,7 +205,7 @@ Architecture:
     name: LayoutXLMForSer
     pretrained: True
     mode: vi
-    # 假设字典中包含n个字段（包含other），由于采用BIO标注，则类别数为2n-1
+    # 由于采用BIO标注，假设字典中包含n个字段（包含other）时，则类别数为2n-1; 假设字典中包含n个字段（不含other）时，则类别数为2n+1。否则在train过程会报：IndexError: (OutOfRange) label value should less than the shape of axis dimension 。
     num_classes: &num_classes 7
 
 PostProcess:
@@ -438,7 +438,25 @@ inference/ser_vi_layoutxlm/
     └── inference.pdmodel           # inference模型的模型结构文件
 ```
 
-RE任务的动转静过程适配中，敬请期待。
+信息抽取模型中的RE任务转inference模型步骤如下：
+
+``` bash
+# -c 后面设置训练算法的yml配置文件
+# -o 配置可选参数
+# Architecture.Backbone.checkpoints 参数设置待转换的训练模型地址
+# Global.save_inference_dir 参数设置转换的模型将保存的地址
+
+python3 tools/export_model.py -c configs/kie/vi_layoutxlm/re_vi_layoutxlm_xfund_zh.yml -o Architecture.Backbone.checkpoints=./output/re_vi_layoutxlm_xfund_zh/best_accuracy Global.save_inference_dir=./inference/re_vi_layoutxlm
+```
+
+转换成功后，在目录下有三个文件：
+
+```
+inference/re_vi_layoutxlm/
+    ├── inference.pdiparams         # inference模型的参数文件
+    ├── inference.pdiparams.info    # inference模型的参数信息，可忽略
+    └── inference.pdmodel           # inference模型的模型结构文件
+```
 
 ## 4.2 模型推理
 
@@ -461,9 +479,39 @@ python3 kie/predict_kie_token_ser.py \
     <img src="../../ppstructure/docs/kie/result_ser/zh_val_42_ser.jpg" width="800">
 </div>
 
+VI-LayoutXLM模型基于RE任务进行推理，可以执行如下命令：
+
+```bash
+cd ppstructure
+python3 kie/predict_kie_token_ser_re.py \
+  --kie_algorithm=LayoutXLM \
+  --re_model_dir=../inference/re_vi_layoutxlm \
+  --ser_model_dir=../inference/ser_vi_layoutxlm \
+  --use_visual_backbone=False \
+  --image_dir=./docs/kie/input/zh_val_42.jpg \
+  --ser_dict_path=../train_data/XFUND/class_list_xfun.txt \
+  --vis_font_path=../doc/fonts/simfang.ttf \
+  --ocr_order_method="tb-yx"
+```
+
+RE可视化结果默认保存到`./output`文件夹里面，结果示例如下：
+
+<div align="center">
+    <img src="../../ppstructure/docs/kie/result_re/zh_val_42_re.jpg" width="800">
+</div>
 
 # 5. FAQ
 
 Q1: 训练模型转inference 模型之后预测效果不一致？
 
 **A**：该问题多是trained model预测时候的预处理、后处理参数和inference model预测的时候的预处理、后处理参数不一致导致的。可以对比训练使用的配置文件中的预处理、后处理和预测时是否存在差异。
+
+Q2: 训练过程中报如下错误：
+ValueError: (InvalidArgument) The 'shape' attribute in ReshapeOp is invalid. The input tensor X'size must be divisible by known capacity of 'shape'. But received X's shape = [4, 512, 23], X's size = 47104, 'shape' is [-1, 7], known capacity of 'shape' is -7.
+**A**：是由于训练使用的配置文件ser_vi_layoutxlm_xfund_zh.yml中Architecture.Backbone.num_classes的值与Loss.num_classes的值不一致导致。
+
+Q3: 训练过程中报如下错误：
+IndexError: (OutOfRange) label value should less than the shape of axis dimension when label value(23) not equal to ignore_index(-100), But received label value as 23 and shape of axis dimension is 23.
+**A**：是由于训练使用的配置文件ser_vi_layoutxlm_xfund_zh.yml中Architecture.Backbone.num_classes的值与Loss.num_classes的值不正确。
+由于采用BIO标注，所以默认会有一个"O"标签，同时会忽略"OTHER", "OTHERS", "IGNORE"三个标签。PostProcess.class_path设置的字典文件中的每种类型会自动扩展成"B-"和"I-"为前缀的标签。
+所以假设字典文件中包含n个类型(包含OTHER)时，num_classes应该为2n-1；假设字典文件中包含n个类型(不含OTHER)时，num_classes应该为2n+1。

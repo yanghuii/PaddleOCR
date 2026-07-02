@@ -100,13 +100,23 @@ class TextRecognizer(object):
                 "use_space_char": args.use_space_char,
                 "rm_symbol": True
             }
-        elif self.rec_algorithm == "SEED":
+        elif self.rec_algorithm == 'RFL':
             postprocess_params = {
-                'name': 'SEEDLabelDecode',
+                'name': 'RFLLabelDecode',
+                "character_dict_path": None,
+                "use_space_char": args.use_space_char
+            }
+        elif self.rec_algorithm == "PREN":
+            postprocess_params = {'name': 'PRENLabelDecode'}
+        elif self.rec_algorithm == "CAN":
+            self.inverse = args.rec_image_inverse
+            postprocess_params = {
+                'name': 'CANLabelDecode',
                 "character_dict_path": args.rec_char_dict_path,
                 "use_space_char": args.use_space_char
             }
         self.postprocess_op = build_post_process(postprocess_params)
+        self.postprocess_params = postprocess_params
         self.predictor, self.input_tensor, self.output_tensors, self.config = \
             utility.create_predictor(args, 'rec', logger)
         self.benchmark = args.benchmark
@@ -130,6 +140,7 @@ class TextRecognizer(object):
                 ],
                 warmup=0,
                 logger=logger)
+        self.return_word_box = args.return_word_box
 
     def resize_norm_img(self, img, max_wh_ratio):
         imgC, imgH, imgW = self.rec_image_shape
@@ -149,6 +160,16 @@ class TextRecognizer(object):
             else:
                 norm_img = norm_img.astype(np.float32) / 128. - 1.
             return norm_img
+        elif self.rec_algorithm == 'RFL':
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            resized_image = cv2.resize(
+                img, (imgW, imgH), interpolation=cv2.INTER_CUBIC)
+            resized_image = resized_image.astype('float32')
+            resized_image = resized_image / 255
+            resized_image = resized_image[np.newaxis, :]
+            resized_image -= 0.5
+            resized_image /= 0.5
+            return resized_image
 
         assert imgC == img.shape[2]
         imgW = int((imgH * max_wh_ratio))
@@ -167,7 +188,6 @@ class TextRecognizer(object):
             if resized_w > self.rec_image_shape[2]:
                 resized_w = self.rec_image_shape[2]
             imgW = self.rec_image_shape[2]
-
         resized_image = cv2.resize(img, (resized_w, imgH))
         resized_image = resized_image.astype('float32')
         resized_image = resized_image.transpose((2, 0, 1)) / 255
@@ -340,6 +360,30 @@ class TextRecognizer(object):
 
         return resized_image
 
+    def norm_img_can(self, img, image_shape):
+
+        img = cv2.cvtColor(
+            img, cv2.COLOR_BGR2GRAY)  # CAN only predict gray scale image
+
+        if self.inverse:
+            img = 255 - img
+
+        if self.rec_image_shape[0] == 1:
+            h, w = img.shape
+            _, imgH, imgW = self.rec_image_shape
+            if h < imgH or w < imgW:
+                padding_h = max(imgH - h, 0)
+                padding_w = max(imgW - w, 0)
+                img_padded = np.pad(img, ((0, padding_h), (0, padding_w)),
+                                    'constant',
+                                    constant_values=(255))
+                img = img_padded
+
+        img = np.expand_dims(img, 0) / 255.0  # h,w,c -> c,h,w
+        img = img.astype('float32')
+
+        return img
+
     def __call__(self, img_list):
         img_num = len(img_list)
         # Calculate the aspect ratio of all text bars
@@ -365,11 +409,12 @@ class TextRecognizer(object):
                 valid_ratios = []
             imgC, imgH, imgW = self.rec_image_shape[:3]
             max_wh_ratio = imgW / imgH
-            # max_wh_ratio = 0
+            wh_ratio_list = []
             for ino in range(beg_img_no, end_img_no):
                 h, w = img_list[indices[ino]].shape[0:2]
                 wh_ratio = w * 1.0 / h
                 max_wh_ratio = max(max_wh_ratio, wh_ratio)
+                wh_ratio_list.append(wh_ratio)
             for ino in range(beg_img_no, end_img_no):
                 if self.rec_algorithm == "SAR":
                     norm_img, _, _, valid_ratio = self.resize_norm_img_sar(
@@ -391,7 +436,7 @@ class TextRecognizer(object):
                                                          self.rec_image_shape)
                     norm_img = norm_img[np.newaxis, :]
                     norm_img_batch.append(norm_img)
-                elif self.rec_algorithm == "VisionLAN":
+                elif self.rec_algorithm in ["VisionLAN", "PREN"]:
                     norm_img = self.resize_norm_img_vl(img_list[indices[ino]],
                                                        self.rec_image_shape)
                     norm_img = norm_img[np.newaxis, :]
@@ -403,11 +448,6 @@ class TextRecognizer(object):
                 elif self.rec_algorithm == "ABINet":
                     norm_img = self.resize_norm_img_abinet(
                         img_list[indices[ino]], self.rec_image_shape)
-                    norm_img = norm_img[np.newaxis, :]
-                    norm_img_batch.append(norm_img)
-                elif self.rec_algorithm == "SEED":
-                    norm_img = self.resize_norm_img_svtr(img_list[indices[ino]],
-                                                         self.rec_image_shape)
                     norm_img = norm_img[np.newaxis, :]
                     norm_img_batch.append(norm_img)
                 elif self.rec_algorithm == "RobustScanner":
@@ -424,6 +464,17 @@ class TextRecognizer(object):
                     word_positions = np.array(range(0, 40)).astype('int64')
                     word_positions = np.expand_dims(word_positions, axis=0)
                     word_positions_list.append(word_positions)
+                elif self.rec_algorithm == "CAN":
+                    norm_img = self.norm_img_can(img_list[indices[ino]],
+                                                 max_wh_ratio)
+                    norm_img = norm_img[np.newaxis, :]
+                    norm_img_batch.append(norm_img)
+                    norm_image_mask = np.ones(norm_img.shape, dtype='float32')
+                    word_label = np.ones([1, 36], dtype='int64')
+                    norm_img_mask_batch = []
+                    word_label_list = []
+                    norm_img_mask_batch.append(norm_image_mask)
+                    word_label_list.append(word_label)
                 else:
                     norm_img = self.resize_norm_img(img_list[indices[ino]],
                                                     max_wh_ratio)
@@ -521,6 +572,33 @@ class TextRecognizer(object):
                     if self.benchmark:
                         self.autolog.times.stamp()
                     preds = outputs[0]
+            elif self.rec_algorithm == "CAN":
+                norm_img_mask_batch = np.concatenate(norm_img_mask_batch)
+                word_label_list = np.concatenate(word_label_list)
+                inputs = [norm_img_batch, norm_img_mask_batch, word_label_list]
+                if self.use_onnx:
+                    input_dict = {}
+                    input_dict[self.input_tensor.name] = norm_img_batch
+                    outputs = self.predictor.run(self.output_tensors,
+                                                 input_dict)
+                    preds = outputs
+                else:
+                    input_names = self.predictor.get_input_names()
+                    input_tensor = []
+                    for i in range(len(input_names)):
+                        input_tensor_i = self.predictor.get_input_handle(
+                            input_names[i])
+                        input_tensor_i.copy_from_cpu(inputs[i])
+                        input_tensor.append(input_tensor_i)
+                    self.input_tensor = input_tensor
+                    self.predictor.run()
+                    outputs = []
+                    for output_tensor in self.output_tensors:
+                        output = output_tensor.copy_to_cpu()
+                        outputs.append(output)
+                    if self.benchmark:
+                        self.autolog.times.stamp()
+                    preds = outputs
             else:
                 if self.use_onnx:
                     input_dict = {}
@@ -541,7 +619,10 @@ class TextRecognizer(object):
                         preds = outputs
                     else:
                         preds = outputs[0]
-            rec_result = self.postprocess_op(preds)
+            if self.postprocess_params['name'] == 'CTCLabelDecode':
+                rec_result = self.postprocess_op(preds, return_word_box=self.return_word_box, wh_ratio_list=wh_ratio_list, max_wh_ratio=max_wh_ratio)
+            else:
+                rec_result = self.postprocess_op(preds)
             for rno in range(len(rec_result)):
                 rec_res[indices[beg_img_no + rno]] = rec_result[rno]
             if self.benchmark:
